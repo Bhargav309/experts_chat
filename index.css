@@ -1,0 +1,133 @@
+/* ── Paste these at the bottom of your existing index.css ── */
+
+/* Make conversation a flex column so bubbles stack correctly */
+.conversation {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Typing indicator */
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 10px 14px;
+}
+
+.typing-indicator span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #64748b;
+  animation: bounce 1.2s infinite ease-in-out;
+}
+
+.typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+.typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); }
+  40%           { transform: translateY(-6px); }
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+body {
+    height: 100vh;
+    background: linear-gradient(135deg, #4b0082, #8a2be2);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.app-container {
+    width: 100%;
+    max-width: 500px;
+}
+
+.chat-container {
+    background: #0f172a;
+    border-radius: 20px;
+    padding: 20px;
+    height: 600px;
+    display: flex;
+    flex-direction: column;
+}
+
+.header {
+    margin-bottom: 15px;
+}
+
+.header h1 {
+    color: white;
+    font-size: 20px;
+}
+
+.header p {
+    color: #94a3b8;
+    font-size: 12px;
+}
+
+.conversation {
+    flex: 1;
+    overflow-y: auto;
+    padding-right: 5px;
+    margin-bottom: 15px;
+}
+
+/* Chat bubbles */
+.speech {
+    padding: 10px 14px;
+    border-radius: 12px;
+    margin-bottom: 10px;
+    max-width: 80%;
+    line-height: 1.4;
+    font-size: 14px;
+}
+
+.speech-human {
+    background: #3b82f6;
+    color: white;
+    align-self: flex-end;
+}
+
+.speech-ai {
+    background: #1e293b;
+    color: #e2e8f0;
+    align-self: flex-start;
+}
+
+/* Input */
+.input-container {
+    display: flex;
+    gap: 10px;
+}
+
+.input-container input {
+    flex: 1;
+    padding: 12px;
+    border-radius: 10px;
+    border: none;
+    outline: none;
+    background: #1e293b;
+    color: white;
+}
+
+.input-container button {
+    padding: 0 16px;
+    border: none;
+    border-radius: 10px;
+    background: #3b82f6;
+    color: white;
+    cursor: pointer;
+    font-size: 16px;
+}
+
+.input-container button:hover {
+    background: #2563eb;
+}
