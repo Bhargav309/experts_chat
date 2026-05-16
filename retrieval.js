@@ -29,43 +29,19 @@ FILTERABLE FIELDS: country, supported_countries, languages, industries, services
 
 // ---------- MASTER SYSTEM RULES ----------
 const MASTER_RULES = `
-You are a Shopify expert search and recommendation engine.
-
-Your job:
-Help users find the most relevant Shopify experts using ONLY retrieved expert evidence.
-
-STRICT RULES:
-- Never invent capabilities, pricing, languages, industries, reviews, experience, or countries.
-- Never assume support unless explicitly evidenced.
-- Distinguish:
-
-Explicit evidence:
-Directly stated
-
-Inferred evidence:
-Likely but not confirmed
-
-Missing evidence:
-No strong proof
-
-- Prefer:
-"No strong evidence found"
-over guessing.
-
-- Prioritize precision over recall.
-- Never recommend irrelevant experts.
-- If no exact match exists:
-    explain closest alternatives
-    explain missing requirements
-
-- Keep answers:
-concise
-structured
-scan-friendly
-factual
-
-- Respect active memory constraints.
-- Preserve confirmed constraints unless changed.
+STRICT RULES — NEVER VIOLATE:
+- NEVER use the words "context", "provided context", "retrieved context", "retrieved data", "the data", "the information provided" in your response.
+- NEVER start your response with "Based on..." or similar phrases.
+- Answer directly as if you already know this information.
+- Use ONLY the information you have been given. Do not invent information.
+- Never return an empty response — always either answer or suggest alternatives.
+- Distinguish between: explicit evidence, inferred evidence, and missing evidence.
+- If evidence is weak or missing, say so clearly. Prefer "No strong evidence found" over guessing.
+- Never recommend irrelevant experts just to fill space.
+- If no exact match exists, explain the closest matches and what is missing.
+- Use concise, search-engine style, structured, scan-friendly responses.
+- Only compare experts when explicitly asked.
+- Respect conversational memory and previously established constraints.
 `.trim();
 
 // ---------- SCENARIO PROMPTS ----------
@@ -211,8 +187,9 @@ async function classifyQuery(query) {
 
 - "comparison"      — explicitly comparing two or more named experts side by side
 
-- "aggregation"     — ONLY pure counting or listing with explicit attribute filters like country, language, industry.
-  e.g. "how many experts from india", "list experts who speak hindi", "how many support clothing"
+- "aggregation"     — ONLY counting queries asking for a NUMBER of experts.
+  e.g. "how many experts from india", "how many support clothing", "how many speak hindi"
+  NOT: "list experts who speak hindi" — that is location
   NOT: "find me someone who builds websites" — that is recommendation
 
 - "list_all"        — listing ALL experts with no filter (e.g. "show me all experts")
@@ -225,7 +202,9 @@ async function classifyQuery(query) {
 
 - "capabilities"    — asking what an expert can build, their experience, past work, portfolio
 
-- "location"        — filtering by country, city, language, supported regions
+- "location"        — finding/listing/showing experts filtered by country, city, language, or supported regions
+  e.g. "experts who speak hindi", "show me experts from india", "who speaks telugu", "experts who support clothing industry"
+  NOTE: any query asking to FIND or LIST experts by a filter attribute is location, even if it sounds like aggregation
 
 - "follow_up"       — short refinements referencing previous results: "any cheaper?", "only english?", "what about reviews?"
 
@@ -415,6 +394,8 @@ async function planRetrievalStrategy(queryType, hasHistoryExperts, filters) {
   if (queryType === "aggregation" || queryType === "list_all") {
     return hasFilters ? "hard_filter_search" : "plain_aggregation";
   }
+  // Location queries always use hard filter to find experts by attribute, then fetch full profiles
+  if (queryType === "location") return "hard_filter_search";
   if (hasFilters && hasHistoryExperts) return "expert_followup_search";
   if (hasFilters) return "hybrid_search";
   return "semantic_search";
@@ -640,6 +621,62 @@ Reply with ONLY the name. If no name found, reply "unknown".`,
   return completion.choices[0].message.content.trim();
 }
 
+// Detect if query is anchored to a hard filter (language, location, industry, service)
+// Used to decide: no-match → ask follow-up vs no-match → show suggestions
+async function isHardFilterQuery(query) {
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-chat",
+    messages: [
+      {
+        role: "system",
+        content: `Determine if the user's query is anchored to a SPECIFIC hard filter requirement
+such as a language, country, city, industry, or service — where finding no match means
+the answer should be "none found" rather than suggesting unrelated alternatives.
+
+Return "yes" if the query has a specific filter that must be satisfied.
+Return "no" if it's a general/open-ended search.
+
+Examples:
+"experts who speak telugu" -> yes
+"experts from brazil" -> yes
+"experts who support clothing industry" -> yes
+"i need someone for my store" -> no
+"best shopify experts" -> no
+"who does theme customization" -> yes
+
+Reply with ONLY "yes" or "no".`,
+      },
+      { role: "user", content: query },
+    ],
+  });
+  return completion.choices[0].message.content.trim().toLowerCase() === "yes";
+}
+
+// Build a no-match + follow-up response without hitting the generation pipeline
+async function generateNoMatchResponse(query, conversationHistory) {
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-chat",
+    messages: [
+      {
+        role: "system",
+        content: `You are an assistant for a Shopify expert directory.
+The user searched for experts matching a specific filter but NO experts were found.
+
+Rules:
+- Clearly state that no experts were found matching that specific requirement
+- Do NOT suggest or recommend any alternatives unprompted
+- Ask ONE concise follow-up question to help the user relax or adjust their search
+  (e.g. open to a different language? willing to work with English-speaking experts? different region?)
+- Keep it short — 2-3 sentences max
+- Be friendly, not apologetic`,
+      },
+      ...conversationHistory,
+      { role: "user", content: query },
+    ],
+  });
+  return completion.choices[0].message.content.trim();
+}
+
 async function isFilteredAggregation(query) {
   const completion = await deepseek.chat.completions.create({
     model: "deepseek-chat",
@@ -659,17 +696,32 @@ Examples:
   return completion.choices[0].message.content.trim().toLowerCase() === "filtered";
 }
 
-function isPersonalIntroduction(query) {
-  const q = query.trim();
-  const patterns = [
-    /^(my\s+)?name\s+is\s+\w+/i,
-    /^i\s+am\s+\w+/i,
-    /^i'm\s+\w+/i,
-    /^im\s+\w+/i,
-    /^call\s+me\s+\w+/i,
-    /^(hi|hello|hey)[,!]?\s+(i\s+am|i'm|im|my\s+name\s+is)\s+\w+/i,
-  ];
-  return patterns.some((p) => p.test(q));
+async function isPersonalIntroduction(query) {
+  const completion = await deepseek.chat.completions.create({
+    model: "deepseek-chat",
+    messages: [
+      {
+        role: "system",
+        content: `Determine if the user's message is PURELY a personal self-introduction — meaning the user is telling you their own name or identity, with no business request or search intent attached.
+
+Rules:
+- Return "yes" ONLY if the sole purpose of the message is the user introducing themselves (their own name, who they are as a person).
+- Return "no" if the message contains ANY business intent, request, goal, or question — even if it starts with "I am" or "I'm".
+- "I'm a businessman looking for..." → no (has business intent)
+- "I'm John" → yes (pure name introduction)
+- "My name is Sara" → yes
+- "I am looking for a developer" → no (has request)
+- "Hi, I'm Priya" → yes
+- "I'm a fashion designer who needs a store" → no (has request)
+- "call me Alex" → yes
+- "I'm interested in Shopify development" → no (has intent)
+
+Reply with ONLY "yes" or "no".`,
+      },
+      { role: "user", content: query },
+    ],
+  });
+  return completion.choices[0].message.content.trim().toLowerCase() === "yes";
 }
 
 function trimHistory(history, maxTurns = 10) {
@@ -759,8 +811,7 @@ async function fetchMultiFilter(filters) {
 
   const { data, error } = await supabase
     .from("expert_knowledge")
-    .select("content, metadata, expert_id")
-    .eq("chunk_type", "overview")
+    .select("content, metadata, expert_id, chunk_type")
     .in("expert_id", expertIds);
   if (error) { console.error("Multi-filter final fetch error:", error); return []; }
   return data || [];
@@ -821,7 +872,18 @@ async function fetchSemantic(query) {
       }
       return [];
     }
-    return data || [];
+    if (!data?.length) return [];
+
+    // Semantic search only returns a subset of chunk types — missing location_contact, pricing, reviews.
+    // Fetch ALL chunks for the matched expert IDs so the LLM has complete profiles (languages, pricing, etc.)
+    const expertIds = [...new Set(data.map((r) => r.expert_id).filter(Boolean))];
+    const { data: fullChunks, error: fullError } = await supabase
+      .from("expert_knowledge")
+      .select("content, metadata, expert_id, chunk_type")
+      .in("expert_id", expertIds);
+
+    if (fullError || !fullChunks?.length) return data; // fallback to partial data
+    return fullChunks;
   } catch (err) {
     return [{ content: "Semantic search failed internally.", metadata: { chunk_type: "system_error" } }];
   }
@@ -980,10 +1042,11 @@ export async function processQuery(query, conversationHistory = [], memoryState 
   // Trim history upfront
   conversationHistory = trimHistory(conversationHistory);
 
-  // 0. PERSONAL INTRO GUARD — deterministic pre-check before LLM classifier
-  if (isPersonalIntroduction(query)) {
-    const nameMatch = query.match(/(?:name\s+is|i\s+am|i'm|im|call\s+me)\s+(\w+)/i);
-    const userName = nameMatch ? nameMatch[1] : "there";
+  // 0. PERSONAL INTRO GUARD — LLM-based check before classifier
+  if (await isPersonalIntroduction(query)) {
+    // Reuse extractExpertName — it reliably pulls a proper noun from any phrasing
+    const extractedName = await extractExpertName(query);
+    const userName = extractedName && extractedName !== "unknown" ? extractedName : "there";
     const result = await generateAndReturn(
       `The user just said hello and told me their name is ${userName}. Greet them warmly by name.`,
       "",
@@ -1046,31 +1109,26 @@ export async function processQuery(query, conversationHistory = [], memoryState 
       const originalExpertIds = Object.values(expertIdMap);
 
       if (originalExpertIds.length > 0) {
-        const locationChunks = await fetchExpertChunksByIds(originalExpertIds, ["location_contact"]);
-        const locationContext = locationChunks
+        const allChunks = await fetchExpertChunksByIds(originalExpertIds, ["location_contact", "overview"]);
+        const locationContext = allChunks
           .map((c) => `${c.expert_id}: ${c.content}`)
           .join("\n");
         const contextMsg = `There are ${originalExpertIds.length} experts matching: ${originalExpertIds.join(", ")}\n\nEXPERT DETAILS:\n${locationContext}`;
         const result = await generateAndReturn(query, contextMsg, "aggregation", conversationHistory);
         return { ...result, memoryState: updatedMemory };
       } else {
-        // No filter match — fall back to semantic search
-        console.log("  (no filter match — falling back to semantic search)");
-        const semanticResults = await fetchSemantic(query);
-        const validSemantic = semanticResults.filter(
-          (r) => (r.chunk_type ?? r.metadata?.chunk_type) !== "system_error"
-        );
-        if (validSemantic.length) {
-          const grouped = groupResultsByExpert(validSemantic);
-          const context = buildContext(grouped);
-          const result = await generateAndReturn(query, context, "recommendation", conversationHistory);
-          return { ...result, memoryState: updatedMemory };
-        }
-        const suggestions = await fetchSuggestions();
-        const grouped = groupResultsByExpert(suggestions);
-        const context = buildContext(grouped, true);
-        const result = await generateAndReturn(query, context, "recommendation", conversationHistory);
-        return { ...result, memoryState: updatedMemory };
+        // No filter match — tell user and ask a follow-up, no unsolicited suggestions
+        console.log("  (no filter match — returning no-match response)");
+        const noMatchAnswer = await generateNoMatchResponse(query, conversationHistory);
+        return {
+          answer: noMatchAnswer,
+          updatedHistory: [
+            ...conversationHistory,
+            { role: "user", content: query },
+            { role: "assistant", content: noMatchAnswer },
+          ],
+          memoryState: updatedMemory,
+        };
       }
     }
 
@@ -1111,7 +1169,7 @@ export async function processQuery(query, conversationHistory = [], memoryState 
     } else {
       // 9. RETRIEVAL STRATEGY
       const strategy = await planRetrievalStrategy(queryType, false, filters);
-      // console.log(`  Retrieval strategy: ${strategy}`);
+      console.log(`  Retrieval strategy: ${strategy}`);
 
       if (strategy === "hybrid_search") {
         // Combine semantic + filter results
@@ -1128,7 +1186,13 @@ export async function processQuery(query, conversationHistory = [], memoryState 
         results = hybridPriority.length ? [...hybridPriority, ...filterData] : semanticValid;
       } else if (strategy === "hard_filter_search") {
         const filterData = await fetchMultiFilter(filters);
-        results = filterData.length ? filterData : await fetchSemantic(searchQuery);
+        if (filterData.length) {
+          // fetchMultiFilter now returns all chunks — use directly
+          results = filterData;
+        } else {
+          // Hard filter returned nothing — don't silently fall to semantic; surface no-match
+          results = [];
+        }
       } else if (queryType === "specific_expert" || queryType === "reviews" || queryType === "capabilities") {
         results = await fetchExpertByName(searchQuery);
       } else {
@@ -1142,8 +1206,9 @@ export async function processQuery(query, conversationHistory = [], memoryState 
     (r) => (r.chunk_type ?? r.metadata?.chunk_type) !== "system_error"
   );
 
-  // 11. SUGGESTIONS FALLBACK
+  // 11. NO-MATCH HANDLING
   if (!validResults.length) {
+    // If we have history experts but specific chunk type had no data, fetch all chunks for them
     if (historyExpertIds?.length) {
       const allChunks = await fetchExpertChunksByIds(historyExpertIds, null);
       if (allChunks.length) {
@@ -1153,6 +1218,21 @@ export async function processQuery(query, conversationHistory = [], memoryState 
         return { ...result, memoryState: updatedMemory };
       }
     }
+    // If query had a hard filter (language/location/industry/service), tell user and ask follow-up
+    const hardFilter = await isHardFilterQuery(query);
+    if (hardFilter) {
+      const noMatchAnswer = await generateNoMatchResponse(query, conversationHistory);
+      return {
+        answer: noMatchAnswer,
+        updatedHistory: [
+          ...conversationHistory,
+          { role: "user", content: query },
+          { role: "assistant", content: noMatchAnswer },
+        ],
+        memoryState: updatedMemory,
+      };
+    }
+    // Open-ended query with no results — fall back to top suggestions
     const suggestions = await fetchSuggestions();
     if (!suggestions.length) {
       const result = await generateAndReturn(query, "", queryType, conversationHistory);
