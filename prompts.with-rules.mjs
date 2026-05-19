@@ -255,10 +255,14 @@ Rules:
 8. Convert vague budget wording: cheap → low budget, premium → high budget
 9. Preserve previous expert context when the user is clearly referring to earlier results.
 10. Never invent constraints that the user did not explicitly mention.
-11. When preserving or updating language constraints, always ensure "english" is present in the
-    languages array alongside any other languages, unless the user explicitly excluded it.
-    Example: languages was ["hindi", "urdu", "english"] → follow-up says "only telugu" → replace with ["telugu", "english"]
-    Example: user says "no english" → remove english, keep only requested languages.
+11. LANGUAGE FILTER RULE — store ONLY the languages the user explicitly requested.
+    NEVER auto-append "english" to the languages array.
+    English is not a meaningful filter constraint since nearly all experts speak it.
+    Only include English if the user explicitly says "English" or "English-speaking".
+    Example: user says "telugu or tamil" → languages: ["telugu", "tamil"]
+    Example: user says "only telugu" → languages: ["telugu"]
+    Example: user says "english and hindi" → languages: ["english", "hindi"]
+    Example: user says "no english, only hindi" → languages: ["hindi"]
 
 Return ONLY valid JSON:
 {
@@ -309,8 +313,9 @@ Memory State: ${JSON.stringify(memoryState)}
 Rules:
 - Only include EXPLICITLY stated requirements — do not infer
 - CRITICAL DISTINCTION between country and supported_countries:
-  * "I'm from india", "I am based in india", "my business is in india", "I'm an india based seller"
-    → user is stating THEIR OWN location → set country: "india", leave supported_countries: null
+  * "I'm from india", "I am based in india", "my business is in india", "I'm an india based seller",
+    "I'm an india-based seller" → user is stating THEIR OWN location
+    → set supported_countries: "india", leave country: null
   * "I want experts from india", "find me india-based experts", "experts located in india"
     → expert's base location → set country: "india", leave supported_countries: null
   * "experts who support india", "who works with india clients"
@@ -326,14 +331,16 @@ Normalization Rules (always apply):
 - Normalize language names to full English name in lowercase:
   "Español" → "spanish", "हिन्दी" → "hindi", "தமிழ்" → "tamil"
 
-- When the user requests specific languages (e.g. "hindi", "urdu", "tamil"), always append
-  "english" to the languages array. English-speaking experts are always relevant unless the
-  user explicitly says "non-english only" or "no english".
-  Example: "speaks hindi or urdu" → languages: ["hindi", "urdu", "english"]
-  Example: "only telugu" → languages: ["telugu", "english"]
-  Example: "no english, only hindi" → languages: ["hindi"]
-  NOTE: This applies even when merging from memory state — always ensure "english" is present
-  in the final languages array if any other language is listed.
+LANGUAGE FILTER RULE — CRITICAL:
+- Extract ONLY the languages the user explicitly requested. NEVER append "english" automatically.
+- English is not a meaningful filter since nearly all experts speak it. Adding it breaks language filtering.
+- Only include "english" if the user explicitly says "English" or "English-speaking".
+- Examples:
+  "speaks telugu or tamil" → languages: ["telugu", "tamil"]
+  "only telugu" → languages: ["telugu"]
+  "speaks hindi or urdu" → languages: ["hindi", "urdu"]
+  "english and hindi" → languages: ["english", "hindi"]
+  "no english, only hindi" → languages: ["hindi"]
 
 Return ONLY valid JSON:
 {

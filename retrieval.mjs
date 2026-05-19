@@ -201,6 +201,35 @@ async function applyHallucinationGuard(response, context) {
 // UTILITY FUNCTIONS
 // ============================================================
 
+// ============================================================
+// NEW FUNCTION — after fetchMultiFilter
+// ============================================================
+
+async function fetchWithCountryFallback(filters) {
+  // Pass 1: experts physically BASED in the user's country
+  const pass1Filters = {
+    ...filters,
+    country: filters.supported_countries,   // remap: treat user's country as expert base country
+    supported_countries: [],
+  };
+  const pass1Results = await fetchMultiFilter(pass1Filters);
+
+  if (pass1Results.length > 0) {
+    return { results: pass1Results, pass: 1 };
+  }
+
+  // Pass 2: experts from ANY country who SUPPORT the user's country
+  const pass2Filters = {
+    ...filters,
+    country: [],
+    supported_countries: filters.supported_countries,
+  };
+  const pass2Results = await fetchMultiFilter(pass2Filters);
+
+  return { results: pass2Results, pass: 2 };
+}
+
+
 function normalizeExpertId(id = "") {
   return String(id).toLowerCase().trim().replace(/[-_\s]/g, "");
 }
@@ -373,10 +402,15 @@ function normalizeFilters(filters = {}) {
         : [],
 
     languages: Array.isArray(filters.languages)
-      ? filters.languages.map(v => v.toLowerCase().trim())
-      : filters.languages
-        ? filters.languages.split(/,|\s+or\s+/i).map(v => v.toLowerCase().trim())
-        : [],
+        ? filters.languages
+        .map(v => v.toLowerCase().trim())
+        .filter(v => v !== 'english')
+        : filters.languages
+          ? filters.languages
+          .split(/,|\s+or\s+/i)
+          .map(v => v.toLowerCase().trim())
+          .filter(v => v !== 'english')
+          : [],
 
     services: Array.isArray(filters.services)
       ? filters.services.map(v => v.toLowerCase().trim())
@@ -550,32 +584,127 @@ async function fetchSemantic(query) {
   }
 }
 
-async function fetchExpertByName(query) {
-  const name = await extractExpertName(query);
-  if (!name || name === "unknown") return await fetchSemantic(query);
+// async function fetchExpertByName(query, strict = false) {
+//   const name = await extractExpertName(query);
+//   if (!name || name === "unknown") return strict ? [] : await fetchSemantic(query);
 
-  const { data: overviewData } = await supabase
-    .from("expert_knowledge")
-    .select("expert_id")
-    .eq("chunk_type", "overview")
-    .ilike("content", `%${name}%`)
-    .limit(1);
+//   const { data: overviewData } = await supabase
+//     .from("expert_knowledge")
+//     .select("expert_id")
+//     .eq("chunk_type", "overview")
+//     .ilike("content", `%${name}%`)
+//     .limit(1);
 
-  if (!overviewData?.length) return await fetchSemantic(query);
+//   if (!overviewData?.length) return strict ? [] : await fetchSemantic(query); // ← key change
 
-  const expertId = overviewData[0].expert_id;
-  const { data, error } = await supabase
-    .from("expert_knowledge")
-    .select("content, metadata, expert_id, chunk_type")
-    .eq("expert_id", expertId);
+//   const expertId = overviewData[0].expert_id;
+//   const { data, error } = await supabase
+//     .from("expert_knowledge")
+//     .select("content, metadata, expert_id, chunk_type")
+//     .eq("expert_id", expertId);
 
-  if (error || !data?.length) return await fetchSemantic(query);
-  return data;
-}
+//   if (error || !data?.length) return strict ? [] : await fetchSemantic(query);
+//   return data;
+// }
 
 // ============================================================
 // CONTEXT / RESPONSE BUILDING
 // ============================================================
+
+function toSlug(str) {
+  return str.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+async function fetchExpertByName(query, strict = false) {
+  console.log("=== fetchExpertByName START ===");
+  console.log("DEBUG input query:", query);
+  console.log("DEBUG strict mode:", strict);
+
+  // 1. LLM name extraction
+  const name = await extractExpertName(query);
+  console.log("DEBUG extractExpertName result:", name);
+
+  // 2. Raw words from query
+  const rawWords = query
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter(w => w.length >= 3 && ![
+      "the","are","for","and","that","there",
+      "named","expert","name","find","is","a","an"
+    ].includes(w));
+  console.log("DEBUG rawWords:", rawWords);
+
+  const candidates = new Set();
+
+  // 3. Raw word scan against expert_id
+  for (const word of rawWords) {
+    const slugWord = toSlug(word);
+    console.log(`DEBUG querying expert_id with word="${word}" slug="${slugWord}"`);
+
+    const { data, error } = await supabase
+      .from("expert_knowledge")
+      .select("expert_id")
+      .eq("chunk_type", "overview")
+      .or(`expert_id.ilike.%${word}%,expert_id.ilike.%${slugWord}%`)
+      .limit(3);
+
+    console.log("DEBUG raw word DB result:", JSON.stringify(data), "error:", error);
+    (data || []).forEach(r => candidates.add(r.expert_id));
+  }
+
+  // 4. LLM name scan against expert_id + content
+  if (name && name !== "unknown") {
+    const slugName = toSlug(name);
+    console.log(`DEBUG LLM name="${name}" slug="${slugName}"`);
+
+    const { data: idMatch, error: idErr } = await supabase
+      .from("expert_knowledge")
+      .select("expert_id")
+      .eq("chunk_type", "overview")
+      .or(`expert_id.ilike.%${name}%,expert_id.ilike.%${slugName}%`)
+      .limit(3);
+
+    console.log("DEBUG idMatch result:", JSON.stringify(idMatch), "error:", idErr);
+    (idMatch || []).forEach(r => candidates.add(r.expert_id));
+
+    const { data: contentMatch, error: contentErr } = await supabase
+      .from("expert_knowledge")
+      .select("expert_id, content")
+      .eq("chunk_type", "overview")
+      .ilike("content", `%${name}%`)
+      .limit(5);
+
+    console.log("DEBUG contentMatch result:", JSON.stringify(contentMatch), "error:", contentErr);
+    (contentMatch || [])
+      .filter(r => {
+        const hit = r.content?.toLowerCase().slice(0, 150).includes(name.toLowerCase());
+        console.log(`DEBUG content slice check for ${r.expert_id}: ${hit}`);
+        return hit;
+      })
+      .forEach(r => candidates.add(r.expert_id));
+  }
+
+  console.log("DEBUG final candidates:", [...candidates]);
+
+  if (!candidates.size) {
+    console.log("DEBUG no candidates — falling back to", strict ? "empty" : "semantic search");
+    return strict ? [] : await fetchSemantic(query);
+  }
+
+  const { data, error } = await supabase
+    .from("expert_knowledge")
+    .select("content, metadata, expert_id, chunk_type")
+    .in("expert_id", [...candidates]);
+
+  console.log("DEBUG final chunk fetch count:", data?.length, "error:", error);
+  console.log("=== fetchExpertByName END ===");
+
+  if (error || !data?.length) return strict ? [] : await fetchSemantic(query);
+  return data;
+}
+
+
 
 function groupResultsByExpert(results) {
   const grouped = {};
@@ -587,7 +716,7 @@ function groupResultsByExpert(results) {
   return grouped;
 }
 
-function buildContext(groupedResults, isSuggestion = false) {
+function buildContext(groupedResults, isSuggestion = false, expertLabels = {}) {
   const chunkOrder = [
     "overview", "capabilities", "location_contact", "pricing",
     "industries", "primary_service", "secondary_services", "featured_work", "review",
@@ -596,7 +725,8 @@ function buildContext(groupedResults, isSuggestion = false) {
   let context = isSuggestion ? "No exact match found. Here are some suggested experts you may consider:\n" : "";
 
   for (const expertId in groupedResults) {
-    context += `\n========================\nEXPERT: ${expertId}\n========================\n`;
+    const label = expertLabels[expertId] ? ` [${expertLabels[expertId]}]` : "";
+    context += `\n========================\nEXPERT: ${expertId}${label}\n========================\n`;
     const chunks = groupedResults[expertId].sort((a, b) => {
       const ai = chunkOrder.indexOf(a.chunk_type ?? a.metadata?.chunk_type);
       const bi = chunkOrder.indexOf(b.chunk_type ?? b.metadata?.chunk_type);
@@ -746,10 +876,13 @@ export async function processQuery(query, conversationHistory = [], memoryState 
 
   // 1. CLASSIFY INTENT
   let queryType = await classifyQuery(query, conversationHistory);
+  console.log("DEBUG queryType:", queryType);
 
   // 2. MEMORY RESOLVER
   let updatedMemory = await resolveMemoryState(query, conversationHistory, memoryState);
   updatedMemory = applyDeterministicMemoryRules(query, memoryState, updatedMemory);
+
+
 
   // 3. FOLLOW-UP OVERRIDE USING MEMORY
   const hasConstraints = Object.values(updatedMemory?.hard_constraints || {}).some(arr => arr?.length);
@@ -838,10 +971,17 @@ export async function processQuery(query, conversationHistory = [], memoryState 
   }
 
   // 7. RESOLVE SEARCH INTENT
-  const searchQuery = await resolveSearchQuery(query, conversationHistory);
-  if (searchQuery === "none") {
-    const result = await generateAndReturn(query, "", queryType, conversationHistory, false);
-    return { ...result, memoryState: updatedMemory };
+    const searchQuery = await resolveSearchQuery(query, conversationHistory);
+    console.log("DEBUG searchQuery:", searchQuery);
+
+    // ← ADD THIS: for specific_expert, always use the original query
+    const effectiveSearchQuery = (searchQuery === "none" || queryType === "specific_expert")
+      ? query
+      : searchQuery;
+
+    if (searchQuery === "none" && queryType !== "specific_expert") {
+      const result = await generateAndReturn(query, "", queryType, conversationHistory, false);
+      return { ...result, memoryState: updatedMemory };
   }
 
   // 8. EXTRACT HARD FILTERS
@@ -850,10 +990,12 @@ export async function processQuery(query, conversationHistory = [], memoryState 
 
   // 9. CHECK HISTORY FOR EXPERT REFERENCES
   const resolvedExperts = await resolveExpertsFromHistory(query, conversationHistory);
+  console.log("DEBUG resolvedExperts:", resolvedExperts);
   let results;
   let historyExpertIds = null;
   let filterData = [];
   let hybridPriority = [];
+  let expertLabels = {};
 
   if (resolvedExperts !== "none") {
     const rawIds = resolvedExperts.split(",").map((e) => e.trim()).filter(Boolean);
@@ -862,6 +1004,7 @@ export async function processQuery(query, conversationHistory = [], memoryState 
     results = await fetchExpertChunksByIds(realIds, null);
   } else {
     const strategy = await planRetrievalStrategy(queryType, false, filters);
+    console.log("DEBUG strategy:", strategy);
     console.log(`Retrieval strategy: ${strategy}`);
 
     if (strategy === "hybrid_search") {
@@ -894,16 +1037,27 @@ export async function processQuery(query, conversationHistory = [], memoryState 
       }
 
     } else if (strategy === "hard_filter_search") {
-      filterData = await fetchMultiFilter(filters);
-      results = filterData.length ? filterData : [];
+  if (filters.supported_countries?.length) {
+    const { results: fallbackResults, pass } = await fetchWithCountryFallback(filters);
+    filterData = fallbackResults;
+    const passLabel = pass === 1 ? "Based in India" : "Supports India";
+    for (const row of filterData) {
+      const id = normalizeExpertId(row.expert_id || row.metadata?.expert_id || "");
+      if (id) expertLabels[id] = passLabel;
+    }
+  } else {
+    filterData = await fetchMultiFilter(filters);
+  }
+  results = filterData.length ? filterData : [];
     } else if (
       queryType === "specific_expert" ||
       queryType === "reviews" ||
       queryType === "capabilities"
     ) {
-      results = await fetchExpertByName(searchQuery);
+      const isExistenceCheck = /\b(is there|do you have|exists?|can you find)\b/i.test(query);
+      results = await fetchExpertByName(effectiveSearchQuery, isExistenceCheck);
     } else {
-      results = await fetchSemantic(searchQuery);
+      results = await fetchSemantic(effectiveSearchQuery);
     }
   }
 
@@ -961,7 +1115,7 @@ export async function processQuery(query, conversationHistory = [], memoryState 
   }
 
   // 13. GENERATE ANSWER
-  const context = buildContext(groupedResults);
+  const context = buildContext(groupedResults, false, expertLabels);
   const matchedExpertIds = Object.keys(groupedResults);
   const pinnedQuery = isFilterDriven
     ? `${query}\n\nIMPORTANT: Only recommend these experts: ${matchedExpertIds.join(", ")}. Do not suggest any others.`
