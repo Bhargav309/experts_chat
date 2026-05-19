@@ -436,19 +436,14 @@ async function fetchMultiFilter(filters) {
     .select("content, metadata, expert_id, chunk_type")
     .eq("chunk_type", "location_contact");
 
-  if (error || !data?.length) {
-    console.error("fetchMultiFilter error:", error);
-    return [];
-  }
+  if (error || !data?.length) return [];
 
   const matchedExpertIds = [];
 
   for (const row of data) {
     const content = (row.content || "").toLowerCase();
-
     const basedInMatch = content.match(/is based in ([^.]+)\./);
     const basedInText = basedInMatch ? basedInMatch[1] : "";
-
     const supportsMatch = content.match(/supports clients in:\s*([^.]+)/);
     const supportsText = supportsMatch ? supportsMatch[1] : "";
 
@@ -476,42 +471,9 @@ async function fetchMultiFilter(filters) {
     }
   }
 
-  let finalExpertIds = matchedExpertIds;
-
-  if (filters.services?.length || filters.industries?.length) {
-    const { data: capData } = await supabase
-      .from("expert_knowledge")
-      .select("content, expert_id")
-      .in("expert_id", matchedExpertIds)
-      .in("chunk_type", ["capabilities", "primary_service", "overview"]);
-
-    const capsByExpert = {};
-    for (const row of (capData || [])) {
-      if (!capsByExpert[row.expert_id]) capsByExpert[row.expert_id] = "";
-      capsByExpert[row.expert_id] += " " + (row.content || "").toLowerCase();
-    }
-
-    finalExpertIds = matchedExpertIds.filter(id => {
-      const text = capsByExpert[id] || "";
-      const servicePass =
-        !filters.services.length ||
-        filters.services.some(s =>
-          new RegExp(`\\b${escapeRegex(s)}\\b`, "i").test(text)
-        );
-      const industryPass =
-        !filters.industries.length ||
-        filters.industries.some(i =>
-          new RegExp(`\\b${escapeRegex(i)}\\b`, "i").test(text)
-        );
-      return servicePass && industryPass;
-    });
-  }
-
-  console.log("FILTER DEBUG", { filters, matchedExperts: finalExpertIds });
-
-  if (!finalExpertIds.length) return [];
-
-  return await fetchExpertChunksByIds(finalExpertIds, null);
+  console.log("FILTER DEBUG", { filters, matchedExperts: matchedExpertIds });
+  if (!matchedExpertIds.length) return [];
+  return await fetchExpertChunksByIds(matchedExpertIds, null);
 }
 
 async function fetchAllProfiles() {
@@ -1118,8 +1080,8 @@ export async function processQuery(query, conversationHistory = [], memoryState 
   const context = buildContext(groupedResults, false, expertLabels);
   const matchedExpertIds = Object.keys(groupedResults);
   const pinnedQuery = isFilterDriven
-    ? `${query}\n\nIMPORTANT: Only recommend these experts: ${matchedExpertIds.join(", ")}. Do not suggest any others.`
-    : query;
+  ? `${query}\n\nIMPORTANT: Only recommend these experts: ${matchedExpertIds.join(", ")}. Do not suggest any others.`
+  : query;
 
   const result = await generateAndReturn(pinnedQuery, context, queryType, conversationHistory, isFilterDriven);
   updatedMemory.last_expert_ids = matchedExpertIds;
