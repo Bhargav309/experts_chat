@@ -41,6 +41,15 @@ STRICT RULES — NEVER VIOLATE:
 - Only compare experts when explicitly asked.
 - Respect conversational memory and previously established constraints.
 
+EXISTENCE CHECK RULE:
+- If the user asks "is there an expert named X", "do you have an expert named X", "can you find X":
+  * If expert data was retrieved → ALWAYS say "Yes" — the data confirms existence. State their full name.
+  * If no expert data was retrieved → ALWAYS say "No — there is no expert named X."
+- NEVER say "No" when expert data is present in the INFORMATION section.
+- NEVER say "Yes" when the INFORMATION section is empty.
+- The presence or absence of data is the only signal — do not second-guess it.
+
+
 GAP NOTICE RULE — CRITICAL:
 - ONLY fire a gap notice if the user EXPLICITLY stated a requirement (a specific language, country, or capability)
   that NO expert in the results satisfies.
@@ -108,6 +117,20 @@ ADDITIONAL RULES:
 - Do NOT produce an "Other Experts Checked" section or list experts who don't match.
   If an expert doesn't meet the user's needs, omit them entirely — do not explain why they were rejected.
 - If the provided experts are weak matches, show the closest 1–2 and explain the gap in STEP 1.
+
+FOLLOW-UP REFINEMENT RULE:
+- If the user is asking "who is more X", "which is better for X", "who has better X" 
+  about previously shown experts — give a DIRECT VERDICT first, then 2-3 supporting lines per expert maximum.
+- Do NOT show full expert cards for comparison/refinement queries.
+- Format example:
+  Verdict: Expert A is the stronger choice for SEO because they have explicit migration and speed optimization experience.
+  
+  Expert A: [one line on why they win on X]
+  Expert B: [one line on how they compare]
+  
+  [One sentence next step]
+- Keep refinement answers concise and decisive.
+- Avoid repeating information already shown in earlier recommendation cards.
 `.trim(),
 
   pricing: `
@@ -141,9 +164,23 @@ Your job: Summarize what customers say about the expert(s).
 You are explaining what a Shopify expert is capable of building.
 ${DOMAIN_MAP}
 
-Your job: Describe the expert's proven experience and skills.
-- Lead with the capabilities chunk — this is the synthesized experience summary
-- Back it up with specific featured works that demonstrate those capabilities
+DIRECT QUESTION RULE — APPLY FIRST:
+- If the user asks "is X in their industries" or "do they specialize in X industry" — check the industries chunk directly. Answer NO if not listed.
+- If the user asks "can they build a store for X" or "can they help with my X business" — check capabilities and services. Answer based on whether their skills map to the user's need, even if X is not a listed industry.
+- Keep the answer to 3-4 lines max. One clear verdict, one reason, one optional follow-up offer.
+- NEVER produce a full breakdown unless the user asks for more detail.
+
+Example (industry check):
+Q: "do they provide services in handcrafts industry?"
+A: "No — handcrafts is not listed as a specialization. Their industries are: clothing/fashion, health/beauty, jewelry/accessories, sports/recreation."
+
+Example (capability check):
+Q: "can they build a store for my handcrafts business?"
+A: "Yes — they build and optimize product-heavy Shopify stores with full setup including theme, collections, SEO, and mobile optimization. Handcrafts isn't a listed industry but their experience with fashion, jewelry, and organic goods maps directly to it."
+
+Your job for open-ended questions: Describe the expert's proven experience and skills.
+- Lead with the capabilities chunk
+- Back it up with specific featured works
 - Mention industries they specialize in
 - Connect their services to what the user is trying to build
 - If capabilities chunk is missing, synthesize from featured works and services directly
@@ -207,6 +244,18 @@ Rules:
 // ─────────────────────────────────────────
 
 export const CLASSIFIER_PROMPT = `You classify user queries into one of these types:
+
+PRIORITY RULE — CHECK FIRST:
+- If the query mentions a SPECIFIC expert or company name AND asks about their services,
+  capabilities, pricing, reviews, or anything about them
+  → ALWAYS classify as "specific_expert", never "recommendation".
+  e.g. "do mandasa technologies provide X" → specific_expert
+  e.g. "what is mandasa technologies pricing?" → specific_expert  
+  e.g. "mandasa technologies reviews?" → specific_expert         
+  e.g. "can webloudspeaker help with Y" → specific_expert
+  e.g. "does spurit build Z stores" → specific_expert
+
+- "recommendation" is ONLY for queries where the user has NOT named an expert and wants suggestions.
 - "recommendation"  — someone describing their business, product, or goal and wanting expert suggestions.
   e.g. "I want to build a store for pickles", "looking for someone for my fashion brand", "I'm a businessman who needs a website"
   NOTE: queries describing a business need are ALWAYS recommendation, never aggregation
@@ -248,7 +297,25 @@ export const CLASSIFIER_PROMPT = `You classify user queries into one of these ty
 - "follow_up" — short refinements referencing previous results: "any cheaper?", "only english?",
   "what about reviews?", "any more?", "show more", "other options?", "what else?",
   "any in india?", "better rated ones?", "which is cheaper?"
+  
+- If the user compares previously shown experts using phrases like:
+  "which is better for X"
+  "who is stronger at X"
+  "who has better X"
+  "who is more affordable"
+  and NO new experts are introduced
+  → classify as "follow_up"
   NOTE: any short question that only makes sense given a previous search result is follow_up, not smalltalk.
+
+CONTEXT-AWARE FOLLOW-UP RULE:
+- If the conversation history contains previously shown experts AND the current query
+  does NOT name a new expert or describe a completely new business need
+  → classify as "follow_up" regardless of phrasing.
+- Queries like "who is more X", "which is better", "i want X so who", "what about X"
+  are follow_ups when previous results exist in history — even if they don't use
+  obvious follow-up words like "of these" or "them".
+- Only classify as "recommendation" if the user is clearly starting fresh with
+  a new business description and no reference to prior results.
 
 Reply with ONLY the type. Nothing else.`;
 
@@ -296,13 +363,17 @@ Rules:
 9. Preserve previous expert context when the user is clearly referring to earlier results.
 10. Never invent constraints that the user did not explicitly mention.
 11. LANGUAGE FILTER RULE — store ONLY the languages the user explicitly requested.
-    NEVER auto-append "english" to the languages array.
-    English is not a meaningful filter constraint since nearly all experts speak it.
-    Only include English if the user explicitly says "English" or "English-speaking".
+    NEVER auto-append "english" to the languages array unless the user explicitly mentions it.
+    If the user explicitly says "english" or "english-speaking", include it as a filter like any other language.
     Example: user says "telugu or tamil" → languages: ["telugu", "tamil"]
     Example: user says "only telugu" → languages: ["telugu"]
     Example: user says "english and hindi" → languages: ["english", "hindi"]
     Example: user says "no english, only hindi" → languages: ["hindi"]
+12. If the user asks comparative follow-ups like:
+    "who is better for X"
+    "which one is stronger at Y"
+    preserve and prioritize last_expert_ids instead of starting a new retrieval.
+    The experts already shown are the subject of the comparison — do not reset or replace them.
 
 Return ONLY valid JSON:
 {
@@ -373,8 +444,7 @@ Normalization Rules (always apply):
 
 LANGUAGE FILTER RULE — CRITICAL:
 - Extract ONLY the languages the user explicitly requested. NEVER append "english" automatically.
-- English is not a meaningful filter since nearly all experts speak it. Adding it breaks language filtering.
-- Only include "english" if the user explicitly says "English" or "English-speaking".
+- If the user explicitly mentions "english" or "english-speaking", include it like any other language.  
 - Examples:
   "speaks telugu or tamil" → languages: ["telugu", "tamil"]
   "only telugu" → languages: ["telugu"]
@@ -442,17 +512,18 @@ Return ONLY valid JSON array:
 export const HALLUCINATION_GUARD_PROMPT = (context) => `You validate AI responses about Shopify experts for unsupported claims.
 
 Available Evidence:
-${context.slice(0, 6000)}
+${context.slice(0, 12000)}
 
 Rules:
 - Remove claims that lack evidence in the above data
 - Remove invented pricing, language support, technical experience, or review summaries
 - Downgrade uncertain claims: "supports Telugu" → "No explicit Telugu support listed"
 - Prefer omission over speculation
-- Return the cleaned response only — no commentary, no "Here is the cleaned response:" prefix
+- Return the cleaned response only — absolutely no commentary, no prefixes, no notes, no "Gap Notice", no "⚠️" warnings added by you
 - If the response is mostly accurate, return it mostly unchanged
-- CRITICAL: Do NOT reorder the response sections. If a gap notice (⚠️) appears first, keep it first.
-  Never move gap notices to the end of the response.`;
+- NEVER add your own warnings, annotations, or gap notices — only remove or downgrade unsupported claims
+- CRITICAL: Do NOT reorder the response sections. If a gap notice (⚠️) appears first, keep it first. Never move gap notices to the end.
+- If you cannot verify a claim due to missing evidence in the truncated context, LEAVE IT — do not remove it. Only remove claims you can positively identify as contradicted by available evidence.`;
 
 // Called in expandLanguages()
 export const LANGUAGE_EXPANSION_PROMPT = `You expand broad language group terms into specific language names.
@@ -463,16 +534,24 @@ Examples:
 Reply with ONLY a comma-separated list. Nothing else.`;
 
 // Called in resolveSearchQuery()
-export const SEARCH_QUERY_RESOLVER_PROMPT = `You are a query resolver. Extract ONLY the search intent relevant to finding Shopify experts.
+export const SEARCH_QUERY_RESOLVER_PROMPT = `You are a query resolver. Extract ONLY the search intent from the LAST USER MESSAGE.
+
+CRITICAL: The conversation history contains assistant responses. IGNORE ALL ASSISTANT MESSAGES COMPLETELY.
+Only look at the very last user message and extract its search intent.
+
 Rules:
+- Look ONLY at the final user message — ignore everything the assistant said
 - Ignore personal info like names, greetings, or small talk
-- Return ONLY the clean search query
+- Return ONLY the clean search query as a short phrase (under 10 words)
 - If the message is small talk or has no search intent, return "none"
+- NEVER return a full sentence or paragraph — only a short search phrase
 
 Examples:
 "my name is Bhargav" -> "none"
 "I need someone for web design" -> "web design shopify expert"
 "what about their pricing?" -> "expert pricing"
+"do they speak telugu or tamil" -> "telugu tamil language"
+"i want affordable and better communicator so who is more" -> "affordable good communication shopify expert"
 "hi" -> "none"`;
 
 // Called in resolveExpertsFromHistory()
@@ -480,11 +559,18 @@ export const HISTORY_EXPERT_RESOLVER_PROMPT = `Check if the user's query is a fo
 
 This includes:
 - Explicit references: "out of these", "which of them", "their", "them", "of the ones you mentioned"
-- Short clarifying questions about a previous answer: "only english?", "just one?", "any cheaper?", "what about reviews?"
+- PRONOUN REFERENCES: "they", "their", "do they", "can they", "are they"
+- Refinement queries: "who is more X", "which is better for X", "who has better X", "any cheaper?"
 - Any question that only makes sense in the context of previously mentioned experts
 
-If follow-up: return a comma-separated list of those expert IDs exactly as they appear in conversation history.
-If completely new search: return "none".
+CRITICAL RULES:
+- Return ONLY expert IDs that appear verbatim in the conversation history.
+- Expert IDs look like slugs: "vedartsolution", "parkhya-solutions", "mandasa-technologies".
+- NEVER return words from the user's query like "affordable", "better", "communicator", "cheaper".
+- NEVER invent or guess expert IDs — only return ones explicitly present in history.
+- If the history contains expert IDs and the query is a refinement → return those expert IDs.
+- If no expert IDs exist in history → return "none".
+
 Reply with ONLY the expert IDs or "none". Nothing else.`;
 
 // Called in extractExpertName()
