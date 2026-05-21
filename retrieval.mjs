@@ -46,7 +46,7 @@ const CHUNK_TYPE_MAP = {
 
 // 1. CLASSIFY / INTENT DETECTION
 async function classifyQuery(query, conversationHistory = []) {
-  const trimmedHistory = sanitizeHistoryForPipeline(conversationHistory.slice(-6));
+  const trimmedHistory = conversationHistory.slice(-6);
 
   const completion = await deepseek.chat.completions.create({
     model: "deepseek-chat",
@@ -277,7 +277,7 @@ async function resolveSearchQuery(query, conversationHistory) {
     model: "deepseek-chat",
     messages: [
       { role: "system", content: SEARCH_QUERY_RESOLVER_PROMPT },
-      ...sanitizeHistoryForPipeline(conversationHistory),
+      ...conversationHistory,
       { role: "user", content: query },
     ],
   });
@@ -289,7 +289,7 @@ async function resolveExpertsFromHistory(query, conversationHistory) {
     model: "deepseek-chat",
     messages: [
       { role: "system", content: HISTORY_EXPERT_RESOLVER_PROMPT },
-      ...sanitizeHistoryForPipeline(conversationHistory),
+      ...conversationHistory,
       { role: "user", content: query },
     ],
   });
@@ -352,23 +352,11 @@ async function isPersonalIntroduction(query) {
   return completion.choices[0].message.content.trim().toLowerCase() === "yes";
 }
 
-
-
 function trimHistory(history, maxTurns = 10) {
   const maxMessages = maxTurns * 2;
   if (history.length <= maxMessages) return history;
   return history.slice(history.length - maxMessages);
 }
-
-function sanitizeHistoryForPipeline(history) {
-  return history.map(msg => {
-    if (msg.role === "assistant") {
-      return { ...msg, content: "[assistant response]" };
-    }
-    return msg;
-  });
-}
-
 
 // ============================================================
 // FETCH FUNCTIONS
@@ -970,8 +958,8 @@ export async function processQuery(query, conversationHistory = [], memoryState 
 
   // 9. CHECK HISTORY FOR EXPERT REFERENCES
   let resolvedExperts = "none";
-  if (memoryState?.last_expert_ids?.length && queryType === "follow_up") {
-    resolvedExperts = memoryState.last_expert_ids.join(", ");
+  if (updatedMemory?.last_expert_ids?.length && queryType === "follow_up") {
+    resolvedExperts = updatedMemory.last_expert_ids.join(", ");
   } else if (queryType !== "recommendation" && queryType !== "specific_expert") {
     resolvedExperts = await resolveExpertsFromHistory(query, conversationHistory);
   }
@@ -1107,19 +1095,7 @@ console.log("DEBUG resolvedExperts:", resolvedExperts);
   : query;
 
   const result = await generateAndReturn(pinnedQuery, context, queryType, conversationHistory, isFilterDriven);
-  
-  const normalizedAnswer = result.answer.toLowerCase().replace(/[-_\s\d]/g, "");
-
-  const mentionedExperts = Object.keys(groupedResults).filter(id => {
-  
-  const normalId = normalizeExpertId(id).replace(/\d+$/, "");
-  return normalId.length >= 4 && normalizedAnswer.includes(normalId);
-  });
-
-updatedMemory.last_expert_ids = mentionedExperts.length > 0
-  ? mentionedExperts
-  : Object.keys(groupedResults);
-
+  updatedMemory.last_expert_ids = Object.keys(groupedResults);
   console.log("updatedMemory.last_experts_ids:" , updatedMemory.last_expert_ids)
   updatedMemory.last_query_type = queryType;
   updatedMemory.last_user_query = query;
