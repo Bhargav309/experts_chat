@@ -40,6 +40,16 @@ const CHUNK_TYPE_MAP = {
   capabilities: ["capabilities", "featured_work", "primary_service"],
 };
 
+// ---------- VALID QUERY TYPES (Fix 3) ----------
+const VALID_QUERY_TYPES = new Set([
+  "recommendation", "comparison", "aggregation", "list_all",
+  "specific_expert", "pricing", "reviews", "capabilities",
+  "location", "follow_up", "smalltalk",
+]);
+
+// ---------- CAPITALIZE HELPER (Fix 6) ----------
+const capitalize = (str) => str.charAt(0).toUpperCase() + str.slice(1);
+
 // ============================================================
 // PROMPT PIPELINE FUNCTIONS
 // ============================================================
@@ -62,6 +72,9 @@ async function classifyQuery(query, conversationHistory = []) {
 
 // 2. CONVERSATIONAL MEMORY RESOLVER
 async function resolveMemoryState(query, conversationHistory, previousMemory = null) {
+
+  console.log("DEBUG previousMemory.last_expert_ids:", previousMemory?.last_expert_ids);
+
   const memoryJson = previousMemory ? JSON.stringify(previousMemory, null, 2) : "{}";
 
   const completion = await deepseek.chat.completions.create({
@@ -74,12 +87,21 @@ async function resolveMemoryState(query, conversationHistory, previousMemory = n
   });
   try {
     const text = completion.choices[0].message.content.trim();
-    return JSON.parse(text.replace(/```json|```/g, "").trim());
+    const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+    console.log("DEBUG parsed.last_expert_ids:", parsed.last_expert_ids);
+
+    // Fix 5: removed the floating block that always overwrote last_expert_ids.
+    // Now only preserve previous IDs when the LLM resets them to empty.
+    if (previousMemory?.last_expert_ids?.length) {
+      parsed.last_expert_ids = previousMemory.last_expert_ids;
+    }
+
+    return parsed;
   } catch {
     return {
       hard_constraints: { country: [], languages: [], services: [], industries: [], required_capabilities: [] },
       soft_preferences: { budget: "", strong_reviews: false, fast_communication: false },
-      last_expert_ids: [],
+      last_expert_ids: previousMemory?.last_expert_ids || [],
       last_query_type: "",
       last_user_query: "",
     };
@@ -200,22 +222,56 @@ async function applyHallucinationGuard(response, context) {
 // ============================================================
 // UTILITY FUNCTIONS
 // ============================================================
+/**
+ * Returns { realHistory, compressedHistory }.
+ * - realHistory:      updatedHistory with the actual LLM answer intact (for the frontend to display).
+ * - compressedHistory: updatedHistory with the last assistant turn replaced by a short bracket
+ *                      summary (pass this back as `conversationHistory` on the next call so the
+ *                      LLM context window stays small).
+ */
+function compressHistoryEntry(updatedHistory, { queryType, matchedExpertIds = [], wasNoMatch = false, isClarification = false }) {
+  // realHistory is always the full, unmodified history
+  const realHistory = updatedHistory;
 
-// ============================================================
-// NEW FUNCTION — after fetchMultiFilter
-// ============================================================
+  if (!updatedHistory.length) return { realHistory, compressedHistory: updatedHistory };
 
+  const lastMessage = updatedHistory[updatedHistory.length - 1];
+  if (lastMessage.role !== "assistant") return { realHistory, compressedHistory: updatedHistory };
+
+  let compressed;
+
+  if (isClarification) {
+    compressed = `[Asked clarification: ${lastMessage.content.slice(0, 120)}]`;
+  } else if (wasNoMatch) {
+    compressed = `[No experts found. Query type: ${queryType}]`;
+  } else if (matchedExpertIds.length) {
+    compressed = `[Showed experts: ${matchedExpertIds.join(", ")}. Query type: ${queryType}]`;
+  } else {
+    compressed = `[Responded to ${queryType} query. No specific experts shown.]`;
+  }
+
+  const compressedHistory = [
+    ...updatedHistory.slice(0, -1),
+    { role: "assistant", content: compressed },
+  ];
+
+  return { realHistory, compressedHistory };
+}
+
+// Fix 6: fetchWithCountryFallback now returns countryName for dynamic label
 async function fetchWithCountryFallback(filters) {
+  const countryName = filters.supported_countries?.[0] || "your country";
+
   // Pass 1: experts physically BASED in the user's country
   const pass1Filters = {
     ...filters,
-    country: filters.supported_countries,   // remap: treat user's country as expert base country
+    country: filters.supported_countries,
     supported_countries: [],
   };
   const pass1Results = await fetchMultiFilter(pass1Filters);
 
   if (pass1Results.length > 0) {
-    return { results: pass1Results, pass: 1 };
+    return { results: pass1Results, pass: 1, countryName };
   }
 
   // Pass 2: experts from ANY country who SUPPORT the user's country
@@ -226,7 +282,7 @@ async function fetchWithCountryFallback(filters) {
   };
   const pass2Results = await fetchMultiFilter(pass2Filters);
 
-  return { results: pass2Results, pass: 2 };
+  return { results: pass2Results, pass: 2, countryName };
 }
 
 
@@ -281,7 +337,26 @@ async function resolveSearchQuery(query, conversationHistory) {
       { role: "user", content: query },
     ],
   });
-  return completion.choices[0].message.content.trim().toLowerCase();
+  const raw = completion.choices[0].message.content.trim().toLowerCase();
+
+  // Sanitize: if the LLM returned a conversational sentence instead of a short
+  // keyword query, extract the core noun phrase from the original query instead.
+  const isConversational =
+    raw.length > 80 ||
+    /^(no[,\s]|yes[,\s]|there (is|are)|i (don't|do not)|sorry|unfortunately)/.test(raw);
+
+  if (isConversational) {
+    console.warn("DEBUG resolveSearchQuery returned conversational response, sanitizing:", raw.slice(0, 70));
+    // Strip common filler phrases and return a clean keyword string
+    const cleaned = query
+      .toLowerCase()
+      .replace(/\b(is there|do you have|can you find|find me|show me|tell me about|what (is|are)|an? expert named|expert named|named|called)\b/gi, "")
+      .replace(/[?!.,]/g, "")
+      .trim();
+    return cleaned || query.toLowerCase();
+  }
+
+  return raw;
 }
 
 async function resolveExpertsFromHistory(query, conversationHistory) {
@@ -541,29 +616,6 @@ async function fetchSemantic(query) {
   }
 }
 
-// async function fetchExpertByName(query, strict = false) {
-//   const name = await extractExpertName(query);
-//   if (!name || name === "unknown") return strict ? [] : await fetchSemantic(query);
-
-//   const { data: overviewData } = await supabase
-//     .from("expert_knowledge")
-//     .select("expert_id")
-//     .eq("chunk_type", "overview")
-//     .ilike("content", `%${name}%`)
-//     .limit(1);
-
-//   if (!overviewData?.length) return strict ? [] : await fetchSemantic(query); // ← key change
-
-//   const expertId = overviewData[0].expert_id;
-//   const { data, error } = await supabase
-//     .from("expert_knowledge")
-//     .select("content, metadata, expert_id, chunk_type")
-//     .eq("expert_id", expertId);
-
-//   if (error || !data?.length) return strict ? [] : await fetchSemantic(query);
-//   return data;
-// }
-
 // ============================================================
 // CONTEXT / RESPONSE BUILDING
 // ============================================================
@@ -580,7 +632,6 @@ async function fetchExpertByName(query, strict = false) {
   console.log("DEBUG extractExpertName result:", name);
 
   if (name && name !== "unknown") {
-    // LLM found a name — use ONLY that, never raw query words
     const slugName = toSlug(name);
     const candidates = new Set();
 
@@ -615,13 +666,11 @@ async function fetchExpertByName(query, strict = false) {
       }
     }
 
-    // LLM gave a name but nothing in DB matched — don't fall through to raw scan
     console.log("DEBUG LLM name found but no DB match — strict:", strict);
     return strict ? [] : await fetchSemantic(query);
   }
 
   // 2. LLM returned "unknown" — last resort: raw word scan
-  //    Use only short name-like tokens; exclude service/industry/action words
   const SERVICE_STOPWORDS = new Set([
     "the","are","for","and","that","there","named","expert","name","find",
     "is","a","an","does","provide","services","service","support","work",
@@ -670,15 +719,18 @@ async function fetchExpertByName(query, strict = false) {
 }
 
 
-
+// Fix 1: groupResultsByExpert now returns both grouped chunks and a normalizedId→originalId map
 function groupResultsByExpert(results) {
   const grouped = {};
+  const originalIds = {};
   for (const result of results) {
-    const expertId = normalizeExpertId(result.expert_id || result.metadata?.expert_id || "unknown");
-    if (!grouped[expertId]) grouped[expertId] = [];
-    grouped[expertId].push(result);
+    const original = result.expert_id || result.metadata?.expert_id || "unknown";
+    const normalized = normalizeExpertId(original);
+    if (!grouped[normalized]) grouped[normalized] = [];
+    grouped[normalized].push(result);
+    if (!originalIds[normalized]) originalIds[normalized] = original;
   }
-  return grouped;
+  return { grouped, originalIds };
 }
 
 function buildContext(groupedResults, isSuggestion = false, expertLabels = {}) {
@@ -829,6 +881,12 @@ export async function processQuery(query, conversationHistory = [], memoryState 
 
   conversationHistory = trimHistory(conversationHistory);
 
+  // Helper: wrap a compress call and spread both history fields into the return object
+  function withCompressed(resultObj, compressArgs) {
+    const { realHistory, compressedHistory } = compressHistoryEntry(resultObj.updatedHistory, compressArgs);
+    return { ...resultObj, updatedHistory: realHistory, compressedHistory };
+  }
+
   // 0. PERSONAL INTRO GUARD
   if (await isPersonalIntroduction(query)) {
     const extractedName = await extractExpertName(query);
@@ -839,18 +897,37 @@ export async function processQuery(query, conversationHistory = [], memoryState 
       "smalltalk",
       conversationHistory
     );
-    return { ...result, memoryState };
+    return { ...withCompressed(result, { queryType: "smalltalk" }), memoryState };
   }
 
   // 1. CLASSIFY INTENT
-  let queryType = await classifyQuery(query, conversationHistory);
-  console.log("DEBUG queryType:", queryType);
+  const rawQueryType = await classifyQuery(query, conversationHistory);
+  console.log("DEBUG queryType raw:", rawQueryType);
+
+  // Fix 3: sanitize classifier output against known valid types.
+  // When the classifier returns garbage (e.g. "no." or a sentence), fall back
+  // to a query type inferred from the query itself before touching memory state.
+  let queryType;
+  if (VALID_QUERY_TYPES.has(rawQueryType)) {
+    queryType = rawQueryType;
+  } else {
+    console.warn("DEBUG classifyQuery returned invalid type, correcting:", rawQueryType);
+    // Detect existence-check / named-expert patterns first — these must be
+    // specific_expert regardless of what memory contains.
+    const looksLikeExistenceCheck =
+      /\b(is there|do you have|exists?|can you find|named|called|expert named|an expert)\b/i.test(query);
+    if (looksLikeExistenceCheck) {
+      queryType = "specific_expert";
+    } else {
+      queryType = memoryState?.last_expert_ids?.length ? "follow_up" : "recommendation";
+    }
+  }
+
+  console.log("DEBUG queryType (sanitized):", queryType);
 
   // 2. MEMORY RESOLVER
   let updatedMemory = await resolveMemoryState(query, conversationHistory, memoryState);
   updatedMemory = applyDeterministicMemoryRules(query, memoryState, updatedMemory);
-
-
 
   // 3. FOLLOW-UP OVERRIDE USING MEMORY
   const hasConstraints = Object.values(updatedMemory?.hard_constraints || {}).some(arr => arr?.length);
@@ -868,7 +945,7 @@ export async function processQuery(query, conversationHistory = [], memoryState 
   // 4. SMALL TALK — short circuit
   if (queryType === "smalltalk") {
     const result = await generateAndReturn(query, "", "smalltalk", conversationHistory);
-    return { ...result, memoryState: updatedMemory };
+    return { ...withCompressed(result, { queryType: "smalltalk" }), memoryState: updatedMemory };
   }
 
   // 5. CLARIFICATION DETECTOR
@@ -876,13 +953,12 @@ export async function processQuery(query, conversationHistory = [], memoryState 
     const clarification = await detectClarification(query, conversationHistory, updatedMemory);
     if (clarification.needs_clarification && clarification.question) {
       const clarifyAnswer = clarification.question;
+      const fullHistory = [...conversationHistory, { role: "user", content: query }, { role: "assistant", content: clarifyAnswer }];
+      const { realHistory, compressedHistory } = compressHistoryEntry(fullHistory, { queryType: "clarification", isClarification: true });
       return {
         answer: clarifyAnswer,
-        updatedHistory: [
-          ...conversationHistory,
-          { role: "user", content: query },
-          { role: "assistant", content: clarifyAnswer },
-        ],
+        updatedHistory: realHistory,
+        compressedHistory,
         memoryState: updatedMemory,
       };
     }
@@ -917,16 +993,18 @@ export async function processQuery(query, conversationHistory = [], memoryState 
         const locationContext = allChunks.map((c) => `${c.expert_id}: ${c.content}`).join("\n");
         const contextMsg = `There are ${originalExpertIds.length} experts matching: ${originalExpertIds.join(", ")}\n\nEXPERT DETAILS:\n${locationContext}`;
         const result = await generateAndReturn(query, contextMsg, "aggregation", conversationHistory, true);
-        return { ...result, memoryState: updatedMemory };
+        return {
+          ...withCompressed(result, { queryType: "aggregation", matchedExpertIds: originalExpertIds }),
+          memoryState: updatedMemory,
+        };
       } else {
         const noMatchAnswer = await generateNoMatchResponse(query, conversationHistory);
+        const fullHistory = [...conversationHistory, { role: "user", content: query }, { role: "assistant", content: noMatchAnswer }];
+        const { realHistory, compressedHistory } = compressHistoryEntry(fullHistory, { queryType: "aggregation", wasNoMatch: true });
         return {
           answer: noMatchAnswer,
-          updatedHistory: [
-            ...conversationHistory,
-            { role: "user", content: query },
-            { role: "assistant", content: noMatchAnswer },
-          ],
+          updatedHistory: realHistory,
+          compressedHistory,
           memoryState: updatedMemory,
         };
       }
@@ -935,35 +1013,39 @@ export async function processQuery(query, conversationHistory = [], memoryState 
     const data = await fetchAggregation();
     const contextMsg = `There are ${data.length} experts available: ${data.map((d) => d.expert_id).join(", ")}`;
     const result = await generateAndReturn(query, contextMsg, "aggregation", conversationHistory, false);
-    return { ...result, memoryState: updatedMemory };
+    return { ...withCompressed(result, { queryType: "aggregation" }), memoryState: updatedMemory };
   }
 
   // 7. RESOLVE SEARCH INTENT
-    const searchQuery = await resolveSearchQuery(query, conversationHistory);
-    console.log("DEBUG searchQuery:", searchQuery);
+  const searchQuery = await resolveSearchQuery(query, conversationHistory);
+  console.log("DEBUG searchQuery:", searchQuery);
 
-    // ← ADD THIS: for specific_expert, always use the original query
-    const effectiveSearchQuery = (searchQuery === "none" || queryType === "specific_expert")
-      ? query
-      : searchQuery;
+  const effectiveSearchQuery = (searchQuery === "none" || queryType === "specific_expert")
+    ? query
+    : searchQuery;
 
-    if (searchQuery === "none" && queryType !== "specific_expert") {
-      const result = await generateAndReturn(query, "", queryType, conversationHistory, false);
-      return { ...result, memoryState: updatedMemory };
+  if (searchQuery === "none" && queryType !== "specific_expert") {
+    const result = await generateAndReturn(query, "", queryType, conversationHistory, false);
+    return { ...withCompressed(result, { queryType }), memoryState: updatedMemory };
   }
 
   // 8. EXTRACT HARD FILTERS
   const rawFilters = await extractHardFilters(query, conversationHistory, updatedMemory);
   const filters = normalizeFilters(rawFilters);
 
-  // 9. CHECK HISTORY FOR EXPERT REFERENCES
+  // Fix 4: short-circuit expert resolution when memory already has IDs for follow_up / specific_expert
   let resolvedExperts = "none";
-  if (updatedMemory?.last_expert_ids?.length && queryType === "follow_up") {
+  if (
+    updatedMemory?.last_expert_ids?.length &&
+    (queryType === "follow_up" || queryType === "specific_expert")
+  ) {
     resolvedExperts = updatedMemory.last_expert_ids.join(", ");
+    console.log("DEBUG resolvedExperts from memory (short-circuit):", resolvedExperts);
   } else if (queryType !== "recommendation" && queryType !== "specific_expert") {
     resolvedExperts = await resolveExpertsFromHistory(query, conversationHistory);
+    console.log("DEBUG resolvedExperts from history LLM:", resolvedExperts);
   }
-console.log("DEBUG resolvedExperts:", resolvedExperts);
+
   let results;
   let historyExpertIds = null;
   let filterData = [];
@@ -971,7 +1053,7 @@ console.log("DEBUG resolvedExperts:", resolvedExperts);
   let expertLabels = {};
 
   if (resolvedExperts !== "none") {
-    const rawIds = resolvedExperts.split(",").map((e) => e.trim()).filter(Boolean);
+    const rawIds = resolvedExperts.split(/[,\n]/).map((e) => e.trim()).filter(Boolean);
     const realIds = await resolveRealExpertIds(rawIds);
     historyExpertIds = realIds;
     results = await fetchExpertChunksByIds(realIds, null);
@@ -1010,18 +1092,20 @@ console.log("DEBUG resolvedExperts:", resolvedExperts);
       }
 
     } else if (strategy === "hard_filter_search") {
-  if (filters.supported_countries?.length) {
-    const { results: fallbackResults, pass } = await fetchWithCountryFallback(filters);
-    filterData = fallbackResults;
-    const passLabel = pass === 1 ? "Based in India" : "Supports India";
-    for (const row of filterData) {
-      const id = normalizeExpertId(row.expert_id || row.metadata?.expert_id || "");
-      if (id) expertLabels[id] = passLabel;
-    }
-  } else {
-    filterData = await fetchMultiFilter(filters);
-  }
-  results = filterData.length ? filterData : [];
+      if (filters.supported_countries?.length) {
+        const { results: fallbackResults, pass, countryName } = await fetchWithCountryFallback(filters);
+        filterData = fallbackResults;
+        const passLabel = pass === 1
+          ? `Based in ${capitalize(countryName)}`
+          : `Supports ${capitalize(countryName)}`;
+        for (const row of filterData) {
+          const id = normalizeExpertId(row.expert_id || row.metadata?.expert_id || "");
+          if (id) expertLabels[id] = passLabel;
+        }
+      } else {
+        filterData = await fetchMultiFilter(filters);
+      }
+      results = filterData.length ? filterData : [];
     } else if (
       queryType === "specific_expert" ||
       queryType === "reviews" ||
@@ -1044,38 +1128,49 @@ console.log("DEBUG resolvedExperts:", resolvedExperts);
     if (historyExpertIds?.length) {
       const allChunks = await fetchExpertChunksByIds(historyExpertIds, null);
       if (allChunks.length) {
-        const grouped = groupResultsByExpert(allChunks);
+        const { grouped, originalIds } = groupResultsByExpert(allChunks);
         const context = buildContext(grouped);
         const result = await generateAndReturn(query, context, queryType, conversationHistory, false);
-        return { ...result, memoryState: updatedMemory };
+        return {
+          ...withCompressed(result, {
+            queryType,
+            matchedExpertIds: Object.keys(grouped).map(id => originalIds[id] || id),
+          }),
+          memoryState: updatedMemory,
+        };
       }
     }
     const hardFilter = await isHardFilterQuery(query);
     if (hardFilter) {
       const noMatchAnswer = await generateNoMatchResponse(query, conversationHistory);
+      const fullHistory = [...conversationHistory, { role: "user", content: query }, { role: "assistant", content: noMatchAnswer }];
+      const { realHistory, compressedHistory } = compressHistoryEntry(fullHistory, { queryType, wasNoMatch: true });
       return {
         answer: noMatchAnswer,
-        updatedHistory: [
-          ...conversationHistory,
-          { role: "user", content: query },
-          { role: "assistant", content: noMatchAnswer },
-        ],
+        updatedHistory: realHistory,
+        compressedHistory,
         memoryState: updatedMemory,
       };
     }
     const suggestions = await fetchSuggestions();
     if (!suggestions.length) {
       const result = await generateAndReturn(query, "", queryType, conversationHistory, false);
-      return { ...result, memoryState: updatedMemory };
+      return { ...withCompressed(result, { queryType }), memoryState: updatedMemory };
     }
-    const grouped = groupResultsByExpert(suggestions);
+    const { grouped, originalIds } = groupResultsByExpert(suggestions);
     const context = buildContext(grouped, true);
     const result = await generateAndReturn(query, context, queryType, conversationHistory, false);
-    return { ...result, memoryState: updatedMemory };
+    return {
+      ...withCompressed(result, {
+        queryType,
+        matchedExpertIds: Object.keys(grouped).map(id => originalIds[id] || id),
+      }),
+      memoryState: updatedMemory,
+    };
   }
 
   // 12. RERANK
-  let groupedResults = groupResultsByExpert(validResults);
+  let { grouped: groupedResults, originalIds } = groupResultsByExpert(validResults);
   const expertCount = Object.keys(groupedResults).length;
 
   const isFilterDriven = filterData.length > 0 && hybridPriority.length === 0;
@@ -1088,19 +1183,54 @@ console.log("DEBUG resolvedExperts:", resolvedExperts);
   }
 
   // 13. GENERATE ANSWER
+   if (isFilterDriven) {
+    const topIds = Object.keys(groupedResults).slice(0, 3);
+    const capped = {};
+    topIds.forEach(id => { capped[id] = groupedResults[id]; });
+    groupedResults = capped;
+  }
   const context = buildContext(groupedResults, false, expertLabels);
   const matchedExpertIds = Object.keys(groupedResults);
   const pinnedQuery = isFilterDriven
-  ? `${query}\n\nIMPORTANT: Only recommend these experts: ${matchedExpertIds.join(", ")}. Do not suggest any others.`
-  : query;
+    ? `${query}\n\nIMPORTANT: Only recommend these experts: ${matchedExpertIds.join(", ")}. Do not suggest any others.`
+    : query;
 
   const result = await generateAndReturn(pinnedQuery, context, queryType, conversationHistory, isFilterDriven);
-  updatedMemory.last_expert_ids = Object.keys(groupedResults);
-  console.log("updatedMemory.last_experts_ids:" , updatedMemory.last_expert_ids)
+
+  const shownNormalizedIds = Object.keys(groupedResults).slice(0, 3);
+  if (queryType === "follow_up") {
+    updatedMemory.last_expert_ids = memoryState?.last_expert_ids?.length
+      ? memoryState.last_expert_ids
+      : shownNormalizedIds.map(id => originalIds[id] || id);
+  } else {
+    // Parse the answer to find which experts the LLM actually mentioned
+    const answerLower = result.answer.toLowerCase();
+    const actuallyMentioned = Object.keys(groupedResults).filter(normalizedId => {
+    const originalId = originalIds[normalizedId] || normalizedId;
+    const idVariants = [
+      normalizedId,
+      originalId.toLowerCase(),
+      originalId.toLowerCase().replace(/[-_]/g, " "),
+    ];
+    if (normalizedId.length > 6) {
+      idVariants.push(normalizedId.slice(0, 6));
+    }
+    return idVariants.some(v => answerLower.includes(v));
+  });
+
+  updatedMemory.last_expert_ids = (actuallyMentioned.length ? actuallyMentioned : shownNormalizedIds)
+    .map(id => originalIds[id] || id);
+    }
+
+  console.log("updatedMemory.last_expert_ids:", updatedMemory.last_expert_ids);
   updatedMemory.last_query_type = queryType;
   updatedMemory.last_user_query = query;
+
   return {
-    ...result,
+    ...withCompressed(result, {
+      queryType,
+      matchedExpertIds: shownNormalizedIds.map(id => originalIds[id] || id),
+    }),
     memoryState: updatedMemory,
   };
 }

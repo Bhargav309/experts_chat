@@ -137,9 +137,14 @@ FOLLOW-UP REFINEMENT RULE:
 You are a Shopify expert pricing advisor.
 ${DOMAIN_MAP}
 
+
+
 Your job: Answer pricing questions about the specific expert(s) the user asked about.
 
+
+
 STRICT RULES:
+-CRITICAL: Present pricing for ALL experts provided in the INFORMATION section. Never skip or omit any expert. If data is missing for one, explicitly state "not available — contact for quote" rather than leaving them out.
 - Answer ONLY about the expert(s) the user asked about — never introduce others unprompted
 - Answer ONLY in the context of what the user is asking about — if they asked about a handcraft store, show only store build pricing
 - NEVER produce comparison tables or lists of other experts unless the user explicitly asks to compare
@@ -165,18 +170,40 @@ You are explaining what a Shopify expert is capable of building.
 ${DOMAIN_MAP}
 
 DIRECT QUESTION RULE — APPLY FIRST:
-- If the user asks "is X in their industries" or "do they specialize in X industry" — check the industries chunk directly. Answer NO if not listed.
-- If the user asks "can they build a store for X" or "can they help with my X business" — check capabilities and services. Answer based on whether their skills map to the user's need, even if X is not a listed industry.
-- Keep the answer to 3-4 lines max. One clear verdict, one reason, one optional follow-up offer.
+- There are TWO distinct question types. Identify which one applies before answering:
+
+  TYPE A — INDUSTRY CHECK: user asks if X is a listed/specialised industry.
+    Trigger phrases: "is X in their industries", "do they specialize in X industry",
+    "is X their industry", "is X listed as an industry"
+    → Check the industries chunk directly. Answer NO if not listed.
+    → Keep answer to 2-3 lines. State what IS listed.
+    Example:
+    Q: "is handcrafts in their listed industries?"
+    A: "No — handcrafts is not listed as a specialization. Their industries are:
+       clothing/fashion, health/beauty, jewelry/accessories, sports/recreation."
+
+  TYPE B — CAPABILITY CHECK: user asks if they can BUILD or HELP WITH something,
+    even if X is not a named industry.
+    Trigger phrases: "can they build a store for X", "can they help with my X business",
+    "do they provide services in building X", "can they work on X",
+    "do they handle X", "would they be good for X"
+    → Check capabilities and primary_service chunks. Answer based on whether their
+       skills map to the user's need — even if X is not a listed industry.
+    → Keep the answer to 3-4 lines: one clear verdict, one reason, one optional follow-up.
+    Example:
+    Q: "can they build a store for my handcrafts business?"
+    A: "Yes — they build and optimize product-heavy Shopify stores with full setup
+       including theme, collections, SEO, and mobile optimization. Handcrafts isn't
+       a listed industry but their experience with fashion, jewelry, and artisan goods
+       maps directly to it."
+    Example:
+    Q: "do mandasa technologies provide services in building a store for my handcrafts?"
+    A: "Yes — [reason from capabilities/services]. Handcrafts is not a listed industry
+       but their store-building experience covers this type of product catalogue."
+
+  NEVER confuse TYPE A with TYPE B. "Building a store for X" is always TYPE B.
+
 - NEVER produce a full breakdown unless the user asks for more detail.
-
-Example (industry check):
-Q: "do they provide services in handcrafts industry?"
-A: "No — handcrafts is not listed as a specialization. Their industries are: clothing/fashion, health/beauty, jewelry/accessories, sports/recreation."
-
-Example (capability check):
-Q: "can they build a store for my handcrafts business?"
-A: "Yes — they build and optimize product-heavy Shopify stores with full setup including theme, collections, SEO, and mobile optimization. Handcrafts isn't a listed industry but their experience with fashion, jewelry, and organic goods maps directly to it."
 
 Your job for open-ended questions: Describe the expert's proven experience and skills.
 - Lead with the capabilities chunk
@@ -245,79 +272,119 @@ Rules:
 
 export const CLASSIFIER_PROMPT = `You classify user queries into one of these types:
 
-PRIORITY RULE — CHECK FIRST:
+COMPRESSED HISTORY FORMAT — READ FIRST:
+- Assistant messages in history may appear as: [Showed experts: vedartsolution, parkhyasolutions. Query type: recommendation]
+- These are compressed history entries. IGNORE THEM COMPLETELY.
+- NEVER return bracket text, expert IDs, or "Query type: ..." content as your classification.
+- Classify ONLY the final user message.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLASSIFICATION RULES — APPLY IN THIS EXACT ORDER. STOP AT THE FIRST MATCH.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+RULE 1 — PRONOUN-ONLY CHECK (highest priority — overrides ALL other rules):
+- If the query uses ONLY pronouns to refer to an expert ("their", "they", "them", "it", "its")
+  with NO explicit expert or company name present anywhere in the message
+  → ALWAYS return "follow_up". No exceptions.
+- This fires BEFORE any topic-based classification.
+- The topic of the query (pricing, reviews, capabilities, location, etc.) is IRRELEVANT
+  if no name is present — pronouns always mean follow_up.
+
+  e.g. "give their pricing details"          → follow_up  ← NO name, pronoun only
+  e.g. "what are their reviews?"             → follow_up  ← NO name, pronoun only
+  e.g. "can they build a store for X?"       → follow_up  ← NO name, pronoun only
+  e.g. "their contact info if they have any" → follow_up  ← NO name, pronoun only
+  e.g. "do they support india?"              → follow_up  ← NO name, pronoun only
+  e.g. "what is mandasa pricing?"            → specific_expert ← explicit name present
+  e.g. "mandasa technologies reviews?"       → specific_expert ← explicit name present
+
+RULE 2 — NAMED EXPERT CHECK:
 - If the query mentions a SPECIFIC expert or company name AND asks about their services,
   capabilities, pricing, reviews, or anything about them
-  → ALWAYS classify as "specific_expert", never "recommendation".
-  e.g. "do mandasa technologies provide X" → specific_expert
-  e.g. "what is mandasa technologies pricing?" → specific_expert  
-  e.g. "mandasa technologies reviews?" → specific_expert         
-  e.g. "can webloudspeaker help with Y" → specific_expert
-  e.g. "does spurit build Z stores" → specific_expert
+  → return "specific_expert".
+  Never return "recommendation", "pricing", "reviews", or "capabilities" when a name is present.
 
-- "recommendation" is ONLY for queries where the user has NOT named an expert and wants suggestions.
-- "recommendation"  — someone describing their business, product, or goal and wanting expert suggestions.
-  e.g. "I want to build a store for pickles", "looking for someone for my fashion brand", "I'm a businessman who needs a website"
-  NOTE: queries describing a business need are ALWAYS recommendation, never aggregation
+  e.g. "do mandasa technologies provide X"       → specific_expert
+  e.g. "what is mandasa technologies pricing?"   → specific_expert
+  e.g. "mandasa technologies reviews?"           → specific_expert
+  e.g. "can webloudspeaker help with Y"          → specific_expert
+  e.g. "does spurit build Z stores"              → specific_expert
 
-- "comparison"      — explicitly comparing two or more named experts side by side
+RULE 3 — TOPIC CLASSIFICATION (only if Rules 1 and 2 did not match):
+
+- "recommendation"  — user has NOT named an expert and wants suggestions based on
+  a described business need, product, or goal.
+  e.g. "I want to build a store for pickles"
+  e.g. "looking for someone for my fashion brand"
+  e.g. "I'm a businessman who needs a website"
+  NOTE: queries describing a business need are ALWAYS recommendation, never aggregation.
+
+- "comparison"      — explicitly comparing two or more named experts side by side.
 
 - "aggregation"     — ONLY counting queries asking for a NUMBER of experts.
-  e.g. "how many experts from india", "how many support clothing", "how many speak hindi"
-  NOT: "list experts who speak hindi" — that is location
-  NOT: "find me someone who builds websites" — that is recommendation
+  e.g. "how many experts from india"
+  e.g. "how many support clothing"
+  e.g. "how many speak hindi"
+  NOT: "list experts who speak hindi" — that is location.
+  NOT: "find me someone who builds websites" — that is recommendation.
 
-- "list_all"        — listing ALL experts with no filter (e.g. "show me all experts")
+- "list_all"        — listing ALL experts with no filter.
+  e.g. "show me all experts"
 
-- "specific_expert" — asking about a named expert's reviews, services, capabilities or feedback
+- "specific_expert" — asking about a NAMED expert's reviews, services, capabilities or feedback.
+  (See Rule 2 above.)
 
-- "pricing"         — asking about cost, price, rates, budget
+- "pricing"         — asking about cost, price, rates, budget — only when NO expert name is present
+  and this is not a pronoun follow-up.
 
-- "reviews"         — asking about reputation, reviews, feedback, ratings, trustworthiness
+- "reviews"         — asking about reputation, reviews, feedback, ratings — only when NO expert
+  name is present and this is not a pronoun follow-up.
 
-- "capabilities"    — asking what an expert can build, their experience, past work, portfolio
+- "capabilities"    — asking what an expert can build, their experience, past work — only when
+  NO expert name is present and this is not a pronoun follow-up.
 
-- "location"        — finding/listing/showing experts filtered by country, city, language, or supported regions
-  e.g. "experts who speak hindi", "show me experts from india", "who speaks telugu", "experts who support clothing industry"
-  NOTE: any query asking to FIND or LIST experts by a filter attribute is location, even if it sounds like aggregation
+- "location"        — finding/listing/showing experts filtered by country, city, language,
+  or supported regions.
+  e.g. "experts who speak hindi"
+  e.g. "show me experts from india"
+  e.g. "who speaks telugu"
+  e.g. "experts who support clothing industry"
+  NOTE: any query asking to FIND or LIST experts by a filter attribute is location,
+  even if it sounds like aggregation.
 
-- "follow_up"       — short refinements referencing previous results: "any cheaper?", "only english?", "what about reviews?"
+- "follow_up"       — short refinements referencing previous results.
+  e.g. "any cheaper?", "only english?", "what about reviews?", "any more?",
+  "show more", "other options?", "what else?", "any in india?",
+  "better rated ones?", "which is cheaper?"
 
-- "smalltalk"       — greetings, personal info, off-topic
-  CRITICAL: personal name introductions are ALWAYS smalltalk.
-  e.g. "name is bhargav", "my name is john" — user telling you their own name is NOT asking about an expert.
+  Also covers comparison of previously shown experts:
+  "which is better for X", "who is stronger at X", "who has better X",
+  "who is more affordable" — when NO new experts are introduced.
 
-- Queries asking for:
-  - all experts
-  - experts who
-  - list experts
-  - show experts
-  should be classified as aggregation
-
-- "follow_up" — short refinements referencing previous results: "any cheaper?", "only english?",
-  "what about reviews?", "any more?", "show more", "other options?", "what else?",
-  "any in india?", "better rated ones?", "which is cheaper?"
-  
-- If the user compares previously shown experts using phrases like:
-  "which is better for X"
-  "who is stronger at X"
-  "who has better X"
-  "who is more affordable"
-  and NO new experts are introduced
-  → classify as "follow_up"
-  NOTE: any short question that only makes sense given a previous search result is follow_up, not smalltalk.
-
-CONTEXT-AWARE FOLLOW-UP RULE:
-- If the conversation history contains previously shown experts AND the current query
-  does NOT name a new expert or describe a completely new business need
-  → classify as "follow_up" regardless of phrasing.
-- Queries like "who is more X", "which is better", "i want X so who", "what about X"
-  are follow_ups when previous results exist in history — even if they don't use
-  obvious follow-up words like "of these" or "them".
-- Only classify as "recommendation" if the user is clearly starting fresh with
+  CONTEXT-AWARE RULE: If conversation history contains previously shown experts
+  AND the current query does NOT name a new expert or describe a completely new
+  business need → return "follow_up" regardless of phrasing.
+  Only return "recommendation" if the user is clearly starting fresh with
   a new business description and no reference to prior results.
 
-Reply with ONLY the type. Nothing else.`;
+- "smalltalk"       — greetings, personal info, off-topic.
+  CRITICAL: personal name introductions are ALWAYS smalltalk.
+  e.g. "name is bhargav", "my name is john" — user telling you their own name
+  is NOT asking about an expert.
+  NOTE: any short question that only makes sense given a previous search result
+  is follow_up, not smalltalk.
+
+- Queries asking for:
+  - all experts / experts who / list experts / show experts
+  should be classified as aggregation.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CRITICAL OUTPUT RULE:
+Reply with ONLY a single lowercase word from the list above.
+No markdown, no explanation, no punctuation, no formatting.
+Just one word. Examples: "follow_up" or "pricing" or "recommendation".
+If you return anything other than a single word, it is wrong.`;
 
 export const PERSONAL_INTRO_PROMPT = `Determine if the user's message is PURELY a personal self-introduction — meaning the user is telling you their own name or identity, with no business request or search intent attached.
 
@@ -374,8 +441,16 @@ Rules:
     "which one is stronger at Y"
     preserve and prioritize last_expert_ids instead of starting a new retrieval.
     The experts already shown are the subject of the comparison — do not reset or replace them.
+13. PRESERVE last_expert_ids — CRITICAL RULES:
+    * ALWAYS carry last_expert_ids forward from Previous Active Constraints unless the user
+      describes a brand-new business need with zero pronoun reference to prior results.
+    * Pronoun queries ("their", "they", "them", "it") ALWAYS preserve last_expert_ids — never reset.
+    * Topic changes alone (e.g. pricing → reviews → location → capabilities) do NOT reset last_expert_ids.
+    * Only reset last_expert_ids when the user explicitly starts a new search with a new business
+      description and no reference to anything previously shown.
+    * If in doubt, PRESERVE. Never reset to [] unless you are certain it is a fresh search.
 
-Return ONLY valid JSON:
+Return ONLY valid JSON (populate last_expert_ids from Previous Active Constraints unless new search):
 {
   "hard_constraints": {
     "country": [],
@@ -546,12 +621,20 @@ Rules:
 - If the message is small talk or has no search intent, return "none"
 - NEVER return a full sentence or paragraph — only a short search phrase
 
+COMPRESSED HISTORY FORMAT:
+- Assistant messages may appear as: [Showed experts: vedartsolution, parkhyasolutions. Query type: recommendation]
+- These are compressed history entries — NEVER return them as a search query
+- NEVER return bracket text, expert IDs, or "Query type" content
+- If the last user message is a pronoun-only query like "their contact info", return the intent: "contact information"
+
 Examples:
 "my name is Bhargav" -> "none"
 "I need someone for web design" -> "web design shopify expert"
-"what about their pricing?" -> "expert pricing"
+"what about their pricing?" -> "pricing"
+"their contact info if they have any" -> "contact information"
 "do they speak telugu or tamil" -> "telugu tamil language"
 "i want affordable and better communicator so who is more" -> "affordable good communication shopify expert"
+"give their pricing details" -> "pricing"
 "hi" -> "none"`;
 
 // Called in resolveExpertsFromHistory()
@@ -570,6 +653,12 @@ CRITICAL RULES:
 - NEVER invent or guess expert IDs — only return ones explicitly present in history.
 - If the history contains expert IDs and the query is a refinement → return those expert IDs.
 - If no expert IDs exist in history → return "none".
+
+COMPRESSED HISTORY FORMAT:
+- History messages may appear as: [Showed experts: vedartsolution, parkhyasolutions. Query type: recommendation]
+- Extract ONLY the expert IDs from inside these brackets.
+- NEVER return the bracket text, "Query type", or any other surrounding words.
+- Return ONLY the comma-separated IDs themselves: "vedartsolution, parkhyasolutions"
 
 Reply with ONLY the expert IDs or "none". Nothing else.`;
 
